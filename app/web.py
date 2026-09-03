@@ -7,8 +7,13 @@ from app.database import SessionLocal, init_db
 from app.models import User, UserSkill, Attempt
 from app.services import get_question, calculate_score, level_for_score, load_questions, random_scenario
 
-app = FastAPI(title="TAIGA Survival Bot Web", version="0.1.0")
+app = FastAPI(title="TAIGA Survival Bot Web", version="0.1.1")
 MODULES = {"fire":"Огонь","water":"Вода","navigation":"Навигация","shelter":"Лагерь","first_aid":"Первая помощь","winter":"Зима"}
+
+# PostgreSQL is optional for the browser demo. If Render's database is temporarily
+# unavailable, the web process must still start and serve the training interface.
+db_available = False
+WEB_DEMO_SKILLS: dict[str, dict] = {}
 
 class Answer(BaseModel):
     module: str
@@ -17,10 +22,16 @@ class Answer(BaseModel):
 
 @app.on_event("startup")
 async def startup():
-    await init_db()
+    global db_available
+    try:
+        await init_db()
+        db_available = True
+    except Exception:
+        db_available = False
 
 @app.get("/health")
-async def health(): return {"status":"ok"}
+async def health():
+    return {"status":"ok", "database":"ok" if db_available else "unavailable"}
 
 @app.get("/api/modules")
 async def modules():
@@ -39,27 +50,56 @@ async def answer(payload: Answer):
     item=next((q for q in load_questions(payload.module) if q["id"]==payload.question_id),None)
     if not item or not 0<=payload.answer<len(item["options"]): raise HTTPException(400,"Некорректный вопрос или ответ")
     correct=payload.answer==item["answer"]
-    async with SessionLocal() as session:
-        user=(await session.execute(select(User).where(User.telegram_id==-1))).scalar_one_or_none()
-        if not user:
-            user=User(telegram_id=-1,username="web_demo",first_name="Web")
-            session.add(user); await session.flush()
-        skill=(await session.execute(select(UserSkill).where(UserSkill.user_id==user.id,UserSkill.module==payload.module))).scalar_one_or_none()
-        if not skill:
-            skill=UserSkill(user_id=user.id,module=payload.module); session.add(skill); await session.flush()
-        skill.attempts+=1; skill.correct+=int(correct); skill.score=calculate_score(skill.score,correct)
-        session.add(Attempt(user_id=user.id,module=payload.module,question_id=payload.question_id,answer=str(payload.answer),is_correct=correct))
-        await session.commit(); score=skill.score
-    return {"correct":correct,"explanation":item["explanation"],"score":score,"level":level_for_score(score)}
+
+    if not db_available:
+        skill=WEB_DEMO_SKILLS.setdefault(payload.module,{"score":0.0,"correct":0,"attempts":0})
+        skill["attempts"] += 1
+        skill["correct"] += int(correct)
+        skill["score"] = calculate_score(skill["score"], correct)
+        score=skill["score"]
+        return {"correct":correct,"explanation":item["explanation"],"score":score,"level":level_for_score(score),"storage":"demo"}
+
+    try:
+        async with SessionLocal() as session:
+            user=(await session.execute(select(User).where(User.telegram_id==-1))).scalar_one_or_none()
+            if not user:
+                user=User(telegram_id=-1,username="web_demo",first_name="Web")
+                session.add(user); await session.flush()
+            skill=(await session.execute(select(UserSkill).where(UserSkill.user_id==user.id,UserSkill.module==payload.module))).scalar_one_or_none()
+            if not skill:
+                skill=UserSkill(user_id=user.id,module=payload.module); session.add(skill); await session.flush()
+            skill.attempts+=1; skill.correct+=int(correct); skill.score=calculate_score(skill.score,correct)
+            session.add(Attempt(user_id=user.id,module=payload.module,question_id=payload.question_id,answer=str(payload.answer),is_correct=correct))
+            await session.commit(); score=skill.score
+        return {"correct":correct,"explanation":item["explanation"],"score":score,"level":level_for_score(score),"storage":"postgres"}
+    except Exception:
+        # A transient DB/DNS failure must not break the public training demo.
+        global db_available
+        db_available = False
+        skill=WEB_DEMO_SKILLS.setdefault(payload.module,{"score":0.0,"correct":0,"attempts":0})
+        skill["attempts"] += 1
+        skill["correct"] += int(correct)
+        skill["score"] = calculate_score(skill["score"], correct)
+        score=skill["score"]
+        return {"correct":correct,"explanation":item["explanation"],"score":score,"level":level_for_score(score),"storage":"demo"}
 
 @app.get("/api/profile")
 async def profile():
-    async with SessionLocal() as session:
-        user=(await session.execute(select(User).where(User.telegram_id==-1))).scalar_one_or_none()
-        if not user: return {"skills":[],"average":0,"level":"Городской"}
-        skills=(await session.execute(select(UserSkill).where(UserSkill.user_id==user.id))).scalars().all()
-    avg=sum(s.score for s in skills)/len(skills) if skills else 0
-    return {"skills":[{"module":s.module,"name":MODULES.get(s.module,s.module),"score":s.score,"correct":s.correct,"attempts":s.attempts} for s in skills],"average":avg,"level":level_for_score(avg)}
+    if not db_available:
+        skills=[{"module":m,"name":MODULES.get(m,m),"score":v["score"],"correct":v["correct"],"attempts":v["attempts"]} for m,v in WEB_DEMO_SKILLS.items()]
+        avg=sum(s["score"] for s in skills)/len(skills) if skills else 0
+        return {"skills":skills,"average":avg,"level":level_for_score(avg),"storage":"demo"}
+    try:
+        async with SessionLocal() as session:
+            user=(await session.execute(select(User).where(User.telegram_id==-1))).scalar_one_or_none()
+            if not user: return {"skills":[],"average":0,"level":"Городской","storage":"postgres"}
+            skills=(await session.execute(select(UserSkill).where(UserSkill.user_id==user.id))).scalars().all()
+        avg=sum(s.score for s in skills)/len(skills) if skills else 0
+        return {"skills":[{"module":s.module,"name":MODULES.get(s.module,s.module),"score":s.score,"correct":s.correct,"attempts":s.attempts} for s in skills],"average":avg,"level":level_for_score(avg),"storage":"postgres"}
+    except Exception:
+        global db_available
+        db_available=False
+        return await profile()
 
 @app.get("/api/scenario")
 async def scenario():
@@ -69,4 +109,4 @@ async def scenario():
 @app.get("/",response_class=HTMLResponse)
 async def index(): return HTMLResponse(INDEX_HTML)
 
-INDEX_HTML='''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TAIGA Survival</title><style>body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0}main{max-width:900px;margin:auto;padding:24px}.muted{color:#aaa}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.card,button{background:#1d1d1d;border:1px solid #383838;border-radius:12px;color:#eee;padding:16px}.card{cursor:pointer}.card:hover,button:hover{background:#292929}button{cursor:pointer;width:100%;margin:6px 0;text-align:left}.nav{display:flex;gap:8px;margin:20px 0}.nav button{width:auto}.hidden{display:none}.bar{height:10px;background:#333;border-radius:10px;overflow:hidden}.fill{height:100%;background:#ddd}</style></head><body><main><h1>TAIGA Survival</h1><div class="muted">Браузерный тренажёр автономности</div><div class="nav"><button onclick="show('training')">Тренировка</button><button onclick="show('profile');profile()">Профиль</button><button onclick="show('scenario');scenario()">Сценарий ЧС</button></div><section id="training"><h2>Модули</h2><div id="modules" class="grid"></div><div id="quiz"></div></section><section id="profile" class="hidden"><h2>Прогресс</h2><div id="stats"></div></section><section id="scenario" class="hidden"><h2>Сценарий</h2><div id="sc"></div></section></main><script>const $=id=>document.getElementById(id);function show(id){['training','profile','scenario'].forEach(x=>$(x).classList.toggle('hidden',x!==id))}async function loadModules(){let m=await fetch('/api/modules').then(r=>r.json());$('modules').innerHTML=m.map(x=>`<div class="card" onclick="question('${x.id}')"><b>${x.name}</b><div class="muted">${x.questions} вопросов</div></div>`).join('')}async function question(m){let q=await fetch('/api/question/'+m).then(r=>r.json());$('quiz').innerHTML=`<div class="card"><h3>${q.question}</h3>${q.options.map((x,i)=>`<button onclick="answer('${m}','${q.id}',${i})">${x}</button>`).join('')}</div>`}async function answer(m,id,i){let r=await fetch('/api/answer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({module:m,question_id:id,answer:i})}).then(x=>x.json());$('quiz').innerHTML=`<div class="card"><h3>${r.correct?'Правильно':'Неправильно'}</h3><p>${r.explanation}</p><b>Навык: ${Math.round(r.score)}% — ${r.level}</b><button onclick="question('${m}')">Следующий вопрос</button></div>`}async function profile(){let p=await fetch('/api/profile').then(r=>r.json());$('stats').innerHTML=`<div class="card"><h3>Уровень: ${p.level}</h3><p>Средний навык: ${Math.round(p.average)}%</p>${p.skills.map(s=>`<p><b>${s.name}</b> — ${Math.round(s.score)}% (${s.correct}/${s.attempts})</p><div class="bar"><div class="fill" style="width:${s.score}%"></div></div>`).join('')}</div>`}async function scenario(){let s=await fetch('/api/scenario').then(r=>r.json());$('sc').innerHTML=`<div class="card"><h3>${s.title}</h3><p>${s.text}</p>${s.options.map(x=>`<button onclick="alert('Демо: выбор принят')">${x}</button>`).join('')}</div>`}loadModules();</script></body></html>'''
+INDEX_HTML='''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TAIGA Survival</title><style>body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0}main{max-width:900px;margin:auto;padding:24px}.muted{color:#aaa}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}.card,button{background:#1d1d1d;border:1px solid #383838;border-radius:12px;color:#eee;padding:16px}.card{cursor:pointer}.card:hover,button:hover{background:#292929}button{cursor:pointer;width:100%;margin:6px 0;text-align:left}.nav{display:flex;gap:8px;margin:20px 0}.nav button{width:auto}.hidden{display:none}.bar{height:10px;background:#333;border-radius:10px;overflow:hidden}.fill{height:100%;background:#ddd}.status{margin-top:12px;padding:10px;border-radius:8px;background:#242424}</style></head><body><main><h1>TAIGA Survival</h1><div class="muted">Браузерный тренажёр автономности</div><div id="status" class="status">Загрузка…</div><div class="nav"><button onclick="show('training')">Тренировка</button><button onclick="show('profile');profile()">Профиль</button><button onclick="show('scenario');scenario()">Сценарий ЧС</button></div><section id="training"><h2>Модули</h2><div id="modules" class="grid"></div><div id="quiz"></div></section><section id="profile" class="hidden"><h2>Прогресс</h2><div id="stats"></div></section><section id="scenario" class="hidden"><h2>Сценарий</h2><div id="sc"></div></section></main><script>const $=id=>document.getElementById(id);function show(id){['training','profile','scenario'].forEach(x=>$(x).classList.toggle('hidden',x!==id))}async function loadModules(){let m=await fetch('/api/modules').then(r=>r.json());$('modules').innerHTML=m.map(x=>`<div class="card" onclick="question('${x.id}')"><b>${x.name}</b><div class="muted">${x.questions} вопросов</div></div>`).join('');let h=await fetch('/health').then(r=>r.json());$('status').textContent=h.database==='ok'?'База данных подключена':'Браузерный demo-режим: база данных временно недоступна'}async function question(m){let q=await fetch('/api/question/'+m).then(r=>r.json());$('quiz').innerHTML=`<div class="card"><h3>${q.question}</h3>${q.options.map((x,i)=>`<button onclick="answer('${m}','${q.id}',${i})">${x}</button>`).join('')}</div>`}async function answer(m,id,i){let r=await fetch('/api/answer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({module:m,question_id:id,answer:i})}).then(x=>x.json());$('quiz').innerHTML=`<div class="card"><h3>${r.correct?'Правильно':'Неправильно'}</h3><p>${r.explanation}</p><b>Навык: ${Math.round(r.score)}% — ${r.level}</b><div class="muted">Хранилище: ${r.storage==='postgres'?'PostgreSQL':'demo'}</div><button onclick="question('${m}')">Следующий вопрос</button></div>`}async function profile(){let p=await fetch('/api/profile').then(r=>r.json());$('stats').innerHTML=`<div class="card"><h3>Уровень: ${p.level}</h3><p>Средний навык: ${Math.round(p.average)}%</p>${p.skills.map(s=>`<p><b>${s.name}</b> — ${Math.round(s.score)}% (${s.correct}/${s.attempts})</p><div class="bar"><div class="fill" style="width:${s.score}%"></div></div>`).join('')}</div>`}async function scenario(){let s=await fetch('/api/scenario').then(r=>r.json());$('sc').innerHTML=`<div class="card"><h3>${s.title}</h3><p>${s.text}</p>${s.options.map(x=>`<button onclick="alert('Демо: выбор принят')">${x}</button>`).join('')}</div>`}loadModules();</script></body></html>'''
