@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: taiga-survival-web
+    name: taiga-survival-bot
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
