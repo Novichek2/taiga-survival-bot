@@ -8,11 +8,14 @@ class Base(DeclarativeBase):
     pass
 
 
+# Render Postgres provides postgresql:// while SQLAlchemy's async driver
+# requires postgresql+asyncpg://. Settings normalizes both forms.
 engine = create_async_engine(settings.async_database_url, pool_pre_ping=True)
 SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
 async def init_db() -> None:
     from app.models import Base as ModelsBase
+
     async with engine.begin() as conn:
         await conn.run_sync(ModelsBase.metadata.create_all)
