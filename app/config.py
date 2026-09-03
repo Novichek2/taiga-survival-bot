@@ -2,7 +2,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    bot_token: str
+    # Web deployment does not require Telegram credentials. The bot process
+    # still needs BOT_TOKEN to be configured when it is started.
+    bot_token: str = ""
     database_url: str = "postgresql+asyncpg://taiga:taiga@db:5432/taiga"
     admin_ids: str = ""
     log_level: str = "INFO"
