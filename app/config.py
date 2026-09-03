@@ -13,5 +13,14 @@ class Settings(BaseSettings):
     def admin_id_set(self) -> set[int]:
         return {int(x.strip()) for x in self.admin_ids.split(",") if x.strip()}
 
+    @property
+    def async_database_url(self) -> str:
+        url = self.database_url
+        if url.startswith("postgres://"):
+            return "postgresql+asyncpg://" + url[len("postgres://"):]
+        if url.startswith("postgresql://"):
+            return "postgresql+asyncpg://" + url[len("postgresql://"):]
+        return url
+
 
 settings = Settings()
