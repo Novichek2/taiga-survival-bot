@@ -7,11 +7,9 @@ from app.database import SessionLocal, init_db
 from app.models import User, UserSkill, Attempt
 from app.services import get_question, calculate_score, level_for_score, load_questions, random_scenario
 
-app = FastAPI(title="TAIGA Survival Bot Web", version="0.1.1")
+app = FastAPI(title="TAIGA Survival Bot Web", version="0.1.2")
 MODULES = {"fire":"Огонь","water":"Вода","navigation":"Навигация","shelter":"Лагерь","first_aid":"Первая помощь","winter":"Зима"}
 
-# PostgreSQL is optional for the browser demo. If Render's database is temporarily
-# unavailable, the web process must still start and serve the training interface.
 db_available = False
 WEB_DEMO_SKILLS: dict[str, dict] = {}
 
@@ -46,18 +44,14 @@ async def question(module: str):
 
 @app.post("/api/answer")
 async def answer(payload: Answer):
+    global db_available
     if payload.module not in MODULES: raise HTTPException(400,"Модуль не найден")
     item=next((q for q in load_questions(payload.module) if q["id"]==payload.question_id),None)
     if not item or not 0<=payload.answer<len(item["options"]): raise HTTPException(400,"Некорректный вопрос или ответ")
     correct=payload.answer==item["answer"]
 
     if not db_available:
-        skill=WEB_DEMO_SKILLS.setdefault(payload.module,{"score":0.0,"correct":0,"attempts":0})
-        skill["attempts"] += 1
-        skill["correct"] += int(correct)
-        skill["score"] = calculate_score(skill["score"], correct)
-        score=skill["score"]
-        return {"correct":correct,"explanation":item["explanation"],"score":score,"level":level_for_score(score),"storage":"demo"}
+        return demo_answer(payload.module, item, correct)
 
     try:
         async with SessionLocal() as session:
@@ -73,22 +67,22 @@ async def answer(payload: Answer):
             await session.commit(); score=skill.score
         return {"correct":correct,"explanation":item["explanation"],"score":score,"level":level_for_score(score),"storage":"postgres"}
     except Exception:
-        # A transient DB/DNS failure must not break the public training demo.
-        global db_available
         db_available = False
-        skill=WEB_DEMO_SKILLS.setdefault(payload.module,{"score":0.0,"correct":0,"attempts":0})
-        skill["attempts"] += 1
-        skill["correct"] += int(correct)
-        skill["score"] = calculate_score(skill["score"], correct)
-        score=skill["score"]
-        return {"correct":correct,"explanation":item["explanation"],"score":score,"level":level_for_score(score),"storage":"demo"}
+        return demo_answer(payload.module, item, correct)
+
+def demo_answer(module: str, item: dict, correct: bool):
+    skill=WEB_DEMO_SKILLS.setdefault(module,{"score":0.0,"correct":0,"attempts":0})
+    skill["attempts"] += 1
+    skill["correct"] += int(correct)
+    skill["score"] = calculate_score(skill["score"], correct)
+    score=skill["score"]
+    return {"correct":correct,"explanation":item["explanation"],"score":score,"level":level_for_score(score),"storage":"demo"}
 
 @app.get("/api/profile")
 async def profile():
+    global db_available
     if not db_available:
-        skills=[{"module":m,"name":MODULES.get(m,m),"score":v["score"],"correct":v["correct"],"attempts":v["attempts"]} for m,v in WEB_DEMO_SKILLS.items()]
-        avg=sum(s["score"] for s in skills)/len(skills) if skills else 0
-        return {"skills":skills,"average":avg,"level":level_for_score(avg),"storage":"demo"}
+        return demo_profile()
     try:
         async with SessionLocal() as session:
             user=(await session.execute(select(User).where(User.telegram_id==-1))).scalar_one_or_none()
@@ -97,9 +91,13 @@ async def profile():
         avg=sum(s.score for s in skills)/len(skills) if skills else 0
         return {"skills":[{"module":s.module,"name":MODULES.get(s.module,s.module),"score":s.score,"correct":s.correct,"attempts":s.attempts} for s in skills],"average":avg,"level":level_for_score(avg),"storage":"postgres"}
     except Exception:
-        global db_available
         db_available=False
-        return await profile()
+        return demo_profile()
+
+def demo_profile():
+    skills=[{"module":m,"name":MODULES.get(m,m),"score":v["score"],"correct":v["correct"],"attempts":v["attempts"]} for m,v in WEB_DEMO_SKILLS.items()]
+    avg=sum(s["score"] for s in skills)/len(skills) if skills else 0
+    return {"skills":skills,"average":avg,"level":level_for_score(avg),"storage":"demo"}
 
 @app.get("/api/scenario")
 async def scenario():
